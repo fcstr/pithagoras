@@ -120,15 +120,23 @@ def _compile(path: str) -> re.Pattern:
 
 
 class App:
-    """Route table shared by the handler. Not thread-local; routes are fixed at boot."""
+    """Route table shared by the handler. Not thread-local; routes are fixed at boot.
+
+    Routes and middleware are matched in registration order, as in Express: an
+    `app.use("/api", gate)` written after the login routes protects everything
+    below it and leaves them open.
+    """
 
     def __init__(self):
         self.routes: list[Route] = []
+        self._chain: list[tuple[str, Any]] = []  # ("route", Route) | ("middleware", (prefix, fn))
         self.middleware: list[tuple[str, _Middleware]] = []
         self.fallback: Optional[Callable[[Request], Any]] = None
 
     def add(self, method: str, path: str, handler: Callable[[Request], Any]):
-        self.routes.append((method.upper(), _compile(path), handler))
+        route: Route = (method.upper(), _compile(path), handler)
+        self.routes.append(route)
+        self._chain.append(("route", route))
 
     def get(self, path: str):
         def deco(fn):
@@ -163,20 +171,24 @@ class App:
     def use(self, prefix: str, fn: _Middleware):
         """Middleware: return a Response to short-circuit, None to continue."""
         self.middleware.append((prefix, fn))
+        self._chain.append(("middleware", (prefix, fn)))
 
     def dispatch(self, req: Request) -> Any:
-        for prefix, fn in self.middleware:
-            if req.path.startswith(prefix):
-                out = fn(req)
-                if out is not None:
-                    return out
-        for method, pattern, handler in self.routes:
-            if method != req.method:
-                continue
-            m = pattern.match(req.path)
-            if m:
-                req.params = {k: urllib.parse.unquote(v) for k, v in m.groupdict().items()}
-                return handler(req)
+        for kind, entry in self._chain:
+            if kind == "middleware":
+                prefix, fn = entry
+                if req.path.startswith(prefix):
+                    out = fn(req)
+                    if out is not None:
+                        return out
+            else:
+                method, pattern, handler = entry
+                if method != req.method:
+                    continue
+                m = pattern.match(req.path)
+                if m:
+                    req.params = {k: urllib.parse.unquote(v) for k, v in m.groupdict().items()}
+                    return handler(req)
         if self.fallback:
             return self.fallback(req)
         raise HTTPError(404, "Not found")
